@@ -1,0 +1,298 @@
+-- Script SQL corregido - Plataforma de Crowdfunding PostgreSQL
+-- Respetando formas normales hasta 3FN y relaciones correctas
+
+-- Crear extensiones necesarias
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- =============================================================================
+-- TABLAS PRINCIPALES (ENTIDADES FUERTES)
+-- =============================================================================
+
+-- Tabla de usuarios base
+CREATE TABLE usuarios (
+    user_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    nombre_usuario VARCHAR(50) UNIQUE NOT NULL,
+    nombres VARCHAR(100) NOT NULL,
+    apellidos VARCHAR(100) NOT NULL,
+    correo VARCHAR(255) UNIQUE NOT NULL,
+    contrasena_hash VARCHAR(255) NOT NULL,
+    telefono VARCHAR(20),
+    activo BOOLEAN NOT NULL DEFAULT true,
+    fecha_creacion TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    fecha_actualizacion TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    
+    CONSTRAINT chk_correo_formato CHECK (correo ~* '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$')
+);
+
+-- Tabla de roles del sistema (normalizada)
+CREATE TABLE roles_sistema (
+    rol_id SERIAL PRIMARY KEY,
+    nombre_rol VARCHAR(50) UNIQUE NOT NULL,
+    descripcion TEXT,
+    permisos JSONB -- Para almacenar permisos específicos
+);
+
+-- Tabla de asignación de roles a usuarios
+CREATE TABLE usuarios_roles (
+    user_id UUID NOT NULL REFERENCES usuarios(user_id) ON DELETE CASCADE,
+    rol_id INTEGER NOT NULL REFERENCES roles_sistema(rol_id),
+    fecha_asignacion TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    activo BOOLEAN NOT NULL DEFAULT true,
+    
+    PRIMARY KEY (user_id, rol_id)
+);
+
+-- Tabla de categorías (independiente)
+CREATE TABLE categorias (
+    categoria_id SERIAL PRIMARY KEY,
+    nombre VARCHAR(100) UNIQUE NOT NULL,
+    descripcion TEXT,
+    icono VARCHAR(50),
+    categoria_padre_id INTEGER REFERENCES categorias(categoria_id), -- Para subcategorías
+    activa BOOLEAN NOT NULL DEFAULT true,
+    fecha_creacion TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Tabla de proyectos (SIN campos calculados para respetar 3FN)
+CREATE TABLE proyectos (
+    project_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    titulo VARCHAR(200) NOT NULL,
+    descripcion TEXT NOT NULL,
+    descripcion_corta VARCHAR(500),
+    objetivo_financiero DECIMAL(12,2) NOT NULL CHECK (objetivo_financiero > 0),
+    fecha_inicio DATE NOT NULL,
+    fecha_fin DATE NOT NULL,
+    fecha_creacion TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    fecha_actualizacion TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    
+    -- Estados del proyecto
+    estado VARCHAR(20) NOT NULL DEFAULT 'borrador' 
+        CHECK (estado IN ('borrador', 'publicado', 'financiado', 'completado', 'cancelado', 'suspendido')),
+    
+    -- Ubicación
+    pais VARCHAR(100),
+    ciudad VARCHAR(100),
+    direccion TEXT,
+    
+    -- Usuario creador del proyecto
+    creador_user_id UUID NOT NULL REFERENCES usuarios(user_id),
+    
+    CONSTRAINT chk_fechas_proyecto CHECK (fecha_fin > fecha_inicio)
+);
+
+-- =============================================================================
+-- TABLAS DE RELACIÓN (MUCHOS A MUCHOS)
+-- =============================================================================
+
+-- Relación Proyecto-Categoría (un proyecto puede tener múltiples categorías)
+CREATE TABLE proyectos_categorias (
+    project_id UUID NOT NULL REFERENCES proyectos(project_id) ON DELETE CASCADE,
+    categoria_id INTEGER NOT NULL REFERENCES categorias(categoria_id),
+    fecha_asignacion TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    
+    PRIMARY KEY (project_id, categoria_id)
+);
+
+-- Tabla de participación de usuarios en proyectos (roles específicos por proyecto)
+CREATE TABLE participaciones_proyecto (
+    participacion_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    project_id UUID NOT NULL REFERENCES proyectos(project_id) ON DELETE CASCADE,
+    user_id UUID NOT NULL REFERENCES usuarios(user_id),
+    tipo_participacion VARCHAR(30) NOT NULL 
+        CHECK (tipo_participacion IN ('creador', 'colaborador', 'inversor', 'seguidor')),
+    fecha_participacion TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    activo BOOLEAN NOT NULL DEFAULT true,
+    
+    -- Datos específicos según el tipo de participación
+    rol_colaborador VARCHAR(100), -- Si es colaborador: desarrollador, diseñador, etc.
+    porcentaje_participacion DECIMAL(5,2), -- Si es colaborador con participación
+    
+    UNIQUE (project_id, user_id, tipo_participacion)
+);
+
+-- =============================================================================
+-- SISTEMA DE RECOMPENSAS Y CONTRIBUCIONES
+-- =============================================================================
+
+-- Tabla de recompensas (niveles de contribución con beneficios)
+-- PROPÓSITO: Definir qué recibe un contribuyente según su nivel de aporte
+CREATE TABLE recompensas (
+    recompensa_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    project_id UUID NOT NULL REFERENCES proyectos(project_id) ON DELETE CASCADE,
+    titulo VARCHAR(200) NOT NULL,
+    descripcion TEXT NOT NULL,
+    monto_minimo DECIMAL(10,2) NOT NULL CHECK (monto_minimo > 0),
+    cantidad_limite INTEGER CHECK (cantidad_limite IS NULL OR cantidad_limite > 0),
+    fecha_entrega_estimada DATE,
+    activa BOOLEAN NOT NULL DEFAULT true,
+    orden_visualizacion INTEGER DEFAULT 0,
+    fecha_creacion TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Tabla de contribuciones (aportes financieros de usuarios)
+-- PROPÓSITO: Registrar cada aporte financiero y su estado de procesamiento
+CREATE TABLE contribuciones (
+    contribucion_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    project_id UUID NOT NULL REFERENCES proyectos(project_id),
+    contribuyente_user_id UUID NOT NULL REFERENCES usuarios(user_id),
+    recompensa_id UUID REFERENCES recompensas(recompensa_id), -- Puede ser NULL si no eligió recompensa
+    
+    -- Información financiera (sin campos calculados para 3FN)
+    monto_bruto DECIMAL(10,2) NOT NULL CHECK (monto_bruto > 0),
+    porcentaje_comision DECIMAL(5,4) NOT NULL DEFAULT 0.05, -- 5% por defecto
+    
+    -- Estado y procesamiento
+    estado VARCHAR(20) NOT NULL DEFAULT 'pendiente'
+        CHECK (estado IN ('pendiente', 'procesando', 'confirmada', 'fallida', 'reembolsada')),
+    fecha_contribucion TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    fecha_confirmacion TIMESTAMP WITH TIME ZONE,
+    
+    -- Información de pago
+    metodo_pago VARCHAR(50),
+    referencia_externa VARCHAR(100),
+    
+    anonima BOOLEAN NOT NULL DEFAULT false,
+    comentario_publico TEXT
+);
+
+-- =============================================================================
+-- TABLAS COMPLEMENTARIAS
+-- =============================================================================
+
+-- Tabla de comentarios
+CREATE TABLE comentarios (
+    comentario_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    project_id UUID NOT NULL REFERENCES proyectos(project_id) ON DELETE CASCADE,
+    autor_user_id UUID NOT NULL REFERENCES usuarios(user_id),
+    comentario_padre_id UUID REFERENCES comentarios(comentario_id),
+    
+    texto TEXT NOT NULL,
+    fecha_comentario TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    fecha_edicion TIMESTAMP WITH TIME ZONE,
+    editado BOOLEAN NOT NULL DEFAULT false,
+    activo BOOLEAN NOT NULL DEFAULT true,
+    
+    CONSTRAINT chk_texto_no_vacio CHECK (LENGTH(TRIM(texto)) > 0)
+);
+
+-- Tabla de actualizaciones del proyecto
+CREATE TABLE actualizaciones_proyecto (
+    actualizacion_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    project_id UUID NOT NULL REFERENCES proyectos(project_id) ON DELETE CASCADE,
+    autor_user_id UUID NOT NULL REFERENCES usuarios(user_id),
+    titulo VARCHAR(200) NOT NULL,
+    contenido TEXT NOT NULL,
+    fecha_publicacion TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    visible_para VARCHAR(20) NOT NULL DEFAULT 'publico'
+        CHECK (visible_para IN ('publico', 'contribuyentes', 'colaboradores'))
+);
+
+-- Tabla de materiales multimedia
+CREATE TABLE materiales_multimedia (
+    material_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    project_id UUID NOT NULL REFERENCES proyectos(project_id) ON DELETE CASCADE,
+    tipo_material VARCHAR(20) NOT NULL CHECK (tipo_material IN ('imagen', 'video', 'documento', 'audio')),
+    nombre_archivo VARCHAR(255) NOT NULL,
+    url_archivo VARCHAR(500) NOT NULL,
+    descripcion TEXT,
+    orden_visualizacion INTEGER DEFAULT 0,
+    es_principal BOOLEAN NOT NULL DEFAULT false,
+    tamaño_bytes BIGINT,
+    fecha_subida TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- =============================================================================
+-- VISTAS PARA CAMPOS CALCULADOS
+-- =============================================================================
+
+-- Vista para proyectos con información calculada
+CREATE VIEW vista_proyectos_completa AS
+SELECT 
+    p.*,
+    COALESCE(SUM(CASE WHEN c.estado = 'confirmada' THEN (c.monto_bruto * (1 - c.porcentaje_comision)) ELSE 0 END), 0) as monto_recaudado,
+    COUNT(CASE WHEN c.estado = 'confirmada' THEN 1 END) as total_contribuciones,
+    COUNT(DISTINCT CASE WHEN c.estado = 'confirmada' THEN c.contribuyente_user_id END) as total_contribuyentes,
+    (p.objetivo_financiero <= COALESCE(SUM(CASE WHEN c.estado = 'confirmada' THEN (c.monto_bruto * (1 - c.porcentaje_comision)) ELSE 0 END), 0)) as objetivo_alcanzado,
+    CASE 
+        WHEN p.fecha_fin < CURRENT_DATE THEN 'finalizado'
+        WHEN p.fecha_inicio > CURRENT_DATE THEN 'por_iniciar'
+        ELSE 'activo'
+    END as estado_temporal
+FROM proyectos p
+    LEFT JOIN contribuciones c ON p.project_id = c.project_id
+GROUP BY p.project_id;
+
+-- Vista para recompensas con cantidad reclamada
+CREATE VIEW vista_recompensas_disponibilidad AS
+SELECT 
+    r.*,
+    COUNT(c.contribucion_id) as cantidad_reclamada,
+    CASE 
+        WHEN r.cantidad_limite IS NULL THEN true
+        ELSE (r.cantidad_limite > COUNT(c.contribucion_id))
+    END as disponible
+FROM recompensas r
+    LEFT JOIN contribuciones c ON r.recompensa_id = c.recompensa_id AND c.estado = 'confirmada'
+WHERE r.activa = true
+GROUP BY r.recompensa_id;
+
+-- =============================================================================
+-- ÍNDICES PARA OPTIMIZACIÓN
+-- =============================================================================
+
+CREATE INDEX idx_proyectos_estado ON proyectos(estado);
+CREATE INDEX idx_proyectos_fechas ON proyectos(fecha_inicio, fecha_fin);
+CREATE INDEX idx_proyectos_creador ON proyectos(creador_user_id);
+CREATE INDEX idx_contribuciones_proyecto ON contribuciones(project_id);
+CREATE INDEX idx_contribuciones_usuario ON contribuciones(contribuyente_user_id);
+CREATE INDEX idx_contribuciones_estado ON contribuciones(estado);
+CREATE INDEX idx_participaciones_proyecto ON participaciones_proyecto(project_id, tipo_participacion);
+CREATE INDEX idx_comentarios_proyecto ON comentarios(project_id);
+
+-- =============================================================================
+-- FUNCIONES Y TRIGGERS
+-- =============================================================================
+
+-- Función para actualizar timestamp de modificación
+CREATE OR REPLACE FUNCTION actualizar_timestamp_modificacion()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.fecha_actualizacion = CURRENT_TIMESTAMP;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Triggers para timestamps automáticos
+CREATE TRIGGER trg_usuarios_actualizacion
+    BEFORE UPDATE ON usuarios
+    FOR EACH ROW
+    EXECUTE FUNCTION actualizar_timestamp_modificacion();
+
+CREATE TRIGGER trg_proyectos_actualizacion
+    BEFORE UPDATE ON proyectos
+    FOR EACH ROW
+    EXECUTE FUNCTION actualizar_timestamp_modificacion();
+
+-- =============================================================================
+-- DATOS INICIALES
+-- =============================================================================
+
+-- Insertar roles del sistema
+INSERT INTO roles_sistema (nombre_rol, descripcion) VALUES
+('administrador', 'Acceso completo al sistema'),
+('moderador', 'Puede moderar contenido y proyectos'),
+('usuario_premium', 'Usuario con funcionalidades premium'),
+('usuario_basico', 'Usuario estándar');
+
+-- Insertar categorías principales
+INSERT INTO categorias (nombre, descripcion) VALUES
+('Tecnología', 'Proyectos de innovación tecnológica'),
+('Arte y Diseño', 'Proyectos creativos y artísticos'),
+('Emprendimiento', 'Nuevos negocios y startups'),
+('Educación', 'Proyectos educativos'),
+('Salud', 'Proyectos de salud y bienestar'),
+('Medio Ambiente', 'Sostenibilidad y ecología'),
+('Deportes', 'Proyectos deportivos'),
+('Música', 'Proyectos musicales'),
+('Cine', 'Proyectos audiovisuales'),
+('Literatura', 'Proyectos editoriales');
