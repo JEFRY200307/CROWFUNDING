@@ -61,8 +61,10 @@ Página de crowfunding para proyectos universitarios con fines académicos y/o i
 - React
 ### Back-end
 - Django
+- JWT
 - Python
 
 ### Servicios de externos
 - Cloud API Whatsapp
 - Gemma 3
+- Blockchain
